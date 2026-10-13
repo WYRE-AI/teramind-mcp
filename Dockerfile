@@ -41,6 +41,12 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
+# 0.0.0.0 is the in-container bind. Startup refuses to listen unless
+# CONDUIT_S2S_SECRET is a real secret (empty values and known placeholders
+# are rejected). MCP_ALLOW_INSECURE_DEV=1 is local-only and forces 127.0.0.1,
+# so this address is not used for that bypass. Publish the host port on
+# loopback unless a proxy sits in front. AUTH_MODE=gateway does not read
+# TERAMIND_* from the environment; those arrive per request as headers.
 ENV NODE_ENV=production
 ENV LOG_LEVEL=info
 ENV MCP_TRANSPORT=http

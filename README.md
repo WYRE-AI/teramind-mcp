@@ -19,7 +19,7 @@ Teramind's API is **per-customer-instance** (cloud or on-premise/private-cloud) 
 | `MCP_TRANSPORT` | `stdio` (default) or `http`. |
 | `AUTH_MODE` | `env` (default, reads the vars above) or `gateway` (credentials arrive per-request via `X-Teramind-Access-Token` / `X-Teramind-Instance-Url`, injected by the Conduit gateway). The container image and Compose default to `gateway` and never fall back to `TERAMIND_*`. |
 | `CONDUIT_S2S_SECRET` | Required to start HTTP. Service-to-service secret for `X-Gateway-S2S`. The process logs an error and exits non-zero when this is empty or a known placeholder. Never commit a real value. stdio does not use this. |
-| `MCP_ALLOW_INSECURE_DEV` | Set to exactly `1` for local HTTP without a usable secret. Logs a warning, skips `X-Gateway-S2S`, and listens on `127.0.0.1` only. |
+| `MCP_ALLOW_INSECURE_DEV` | Set to exactly `1` for local HTTP without `CONDUIT_S2S_SECRET`. Logs a warning, skips `X-Gateway-S2S`, and listens on `127.0.0.1` only. A known placeholder secret still refuses to start. |
 | `MCP_HTTP_HOST` | Bind address when a real `CONDUIT_S2S_SECRET` is set. Unset keeps `0.0.0.0`, which is what the container image sets. Without a usable secret the listener is `127.0.0.1`. |
 | `MCP_HTTP_PORT` | HTTP port. Defaults to `8080`. |
 | `LOG_LEVEL` | `debug` \| `info` (default) \| `warn` \| `error`. |
@@ -30,7 +30,7 @@ Teramind's API is **per-customer-instance** (cloud or on-premise/private-cloud) 
 
 `MCP_TRANSPORT=http` refuses to start unless `CONDUIT_S2S_SECRET` is a real secret. Empty values and known placeholders are rejected, including `changeme`, `placeholder`, `your-s2s-secret`, `secret`, `password`, `test`, and any value that is only an unresolved `${...}` template. The process logs an error and exits non-zero. It never prints the secret.
 
-`MCP_ALLOW_INSECURE_DEV=1` is the local-only escape hatch for an empty or placeholder secret. The process logs a warning, does not check `X-Gateway-S2S`, and listens on `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`, `localhost`, and `::1`) is ignored in that mode and the override is logged.
+`MCP_ALLOW_INSECURE_DEV=1` is the local-only escape hatch for a genuinely empty secret — a known placeholder still refuses to start, even with this flag set. The process logs a warning, does not check `X-Gateway-S2S`, and listens on `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`, `localhost`, and `::1`) is ignored in that mode and the override is logged.
 
 Without a usable secret the bind address defaults to `127.0.0.1`. A configured secret honors `MCP_HTTP_HOST` (default `0.0.0.0` when that variable is unset, which is what the container image sets). Publish the host port on loopback unless a proxy sits in front.
 

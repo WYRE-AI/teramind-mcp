@@ -15,9 +15,11 @@ import {
  *
  * An empty CONDUIT_S2S_SECRET used to skip the X-Gateway-S2S check. Startup
  * now refuses to listen unless the secret is set and is not a known
- * placeholder or unresolved `${...}` template. MCP_ALLOW_INSECURE_DEV=1 is
- * the only bypass: it logs a warning, does not enforce S2S, and binds
- * 127.0.0.1 only. A wider MCP_HTTP_HOST is ignored in that mode.
+ * placeholder or unresolved `${...}` template -- a placeholder always
+ * refuses to start, even with MCP_ALLOW_INSECURE_DEV=1. That flag only
+ * bypasses a genuinely empty secret: it logs a warning, does not enforce
+ * S2S, and binds 127.0.0.1 only. A wider MCP_HTTP_HOST is ignored in that
+ * mode.
  *
  * A real secret honors MCP_HTTP_HOST, including 0.0.0.0. When that variable
  * is unset the process keeps the historical 0.0.0.0 bind so container
@@ -37,9 +39,8 @@ const MISSING_S2S_SECRET_ERROR =
 
 const PLACEHOLDER_S2S_SECRET_ERROR =
   'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is a known placeholder value, not a real service-to-service secret. ' +
-  'An empty or placeholder secret would accept unauthenticated /mcp requests (CWE-306). ' +
-  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value, ' +
-  'or set MCP_ALLOW_INSECURE_DEV=1 for local development only.';
+  'A placeholder secret would accept unauthenticated /mcp requests (CWE-306) and is refused even with MCP_ALLOW_INSECURE_DEV=1. ' +
+  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value.';
 
 function refuseStart(message: string): never {
   logger.error(message);
@@ -52,27 +53,30 @@ function headerValue(value: string | string[] | undefined): string | undefined {
 
 /**
  * Fail closed. Read at HTTP startup, not module load, so tests can set the
- * env first. A known placeholder or unresolved template is not a usable
- * secret; MCP_ALLOW_INSECURE_DEV=1 may bypass that the same way it bypasses
- * an empty secret, and the bypass does not check X-Gateway-S2S. The secret
- * value is never logged.
+ * env first. A known placeholder or unresolved template always refuses to
+ * start, even with MCP_ALLOW_INSECURE_DEV=1 -- that flag only bypasses a
+ * genuinely empty secret, and the bypass does not check X-Gateway-S2S. The
+ * secret value is never logged.
  */
-function resolveS2sSecret(env: NodeJS.ProcessEnv = process.env): { secret: string; insecureDev: boolean; placeholder: boolean } {
+function resolveS2sSecret(env: NodeJS.ProcessEnv = process.env): { secret: string; insecureDev: boolean } {
   const trimmed = (env.CONDUIT_S2S_SECRET ?? '').trim();
   if (isUsableConduitS2sSecret(trimmed)) {
-    return { secret: trimmed, insecureDev: false, placeholder: false };
+    return { secret: trimmed, insecureDev: false };
   }
 
-  const placeholder = trimmed.length > 0;
+  if (trimmed.length > 0) {
+    refuseStart(PLACEHOLDER_S2S_SECRET_ERROR);
+  }
+
   if (env.MCP_ALLOW_INSECURE_DEV === '1') {
-    return { secret: '', insecureDev: true, placeholder };
+    return { secret: '', insecureDev: true };
   }
 
-  refuseStart(placeholder ? PLACEHOLDER_S2S_SECRET_ERROR : MISSING_S2S_SECRET_ERROR);
+  refuseStart(MISSING_S2S_SECRET_ERROR);
 }
 
 export async function startHttpTransport(): Promise<Server> {
-  const { secret: s2sSecret, insecureDev, placeholder } = resolveS2sSecret();
+  const { secret: s2sSecret, insecureDev } = resolveS2sSecret();
   const port = parseInt(process.env.MCP_HTTP_PORT || '8080', 10);
   const { host, overriddenHost } = resolveHttpListenHost({
     s2sSecret,
@@ -81,11 +85,8 @@ export async function startHttpTransport(): Promise<Server> {
 
   if (insecureDev) {
     // error level so LOG_LEVEL=warn|error cannot hide the bypass.
-    const why = placeholder
-      ? 'CONDUIT_S2S_SECRET is a known placeholder'
-      : 'CONDUIT_S2S_SECRET is empty';
     logger.error(
-      `SECURITY WARNING: ${why} and MCP_ALLOW_INSECURE_DEV=1. ` +
+      'SECURITY WARNING: CONDUIT_S2S_SECRET is empty and MCP_ALLOW_INSECURE_DEV=1. ' +
         'HTTP /mcp is not enforcing X-Gateway-S2S and listens on 127.0.0.1 only. ' +
         'Do not use this outside local development.',
     );

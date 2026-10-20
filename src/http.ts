@@ -1,34 +1,142 @@
-import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpServer, type Server } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
-import { getCredentials, runWithCredentials } from './client.js';
+import { runWithCredentials } from './client.js';
 import { logger } from './utils/logger.js';
-import { verifyS2sHeader, S2S_HEADER } from './s2s-verify.js';
+import {
+  isUsableConduitS2sSecret,
+  resolveHttpListenHost,
+  verifyS2sHeader,
+  S2S_HEADER,
+} from './s2s-verify.js';
 
-const S2S_SECRET = process.env.CONDUIT_S2S_SECRET || '';
+/**
+ * HTTP transport fails closed (CWE-306).
+ *
+ * An empty CONDUIT_S2S_SECRET used to skip the X-Gateway-S2S check. Startup
+ * now refuses to listen unless the secret is set and is not a known
+ * placeholder or unresolved `${...}` template -- a placeholder always
+ * refuses to start, even with MCP_ALLOW_INSECURE_DEV=1. That flag only
+ * bypasses a genuinely empty secret: it logs a warning, does not enforce
+ * S2S, and binds 127.0.0.1 only. A wider MCP_HTTP_HOST is ignored in that
+ * mode.
+ *
+ * A real secret honors MCP_HTTP_HOST, including 0.0.0.0. When that variable
+ * is unset the process keeps the historical 0.0.0.0 bind so container
+ * deploys stay reachable. The secret value is never logged.
+ *
+ * Gateway mode requires X-Teramind-Access-Token and X-Teramind-Instance-Url
+ * on every /mcp request and does not fall back to TERAMIND_* in the
+ * environment. /health stays unauthenticated and does not read credentials.
+ * The stdio transport does not use S2S auth.
+ */
 
-function startHttpServer(): void {
+const MISSING_S2S_SECRET_ERROR =
+  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is empty. ' +
+  'An empty secret would accept unauthenticated /mcp requests (CWE-306). ' +
+  'Set CONDUIT_S2S_SECRET to the gateway-provisioned secret (openssl rand -hex 32), ' +
+  'or set MCP_ALLOW_INSECURE_DEV=1 for local development only.';
+
+const PLACEHOLDER_S2S_SECRET_ERROR =
+  'Refusing to start HTTP transport: CONDUIT_S2S_SECRET is a known placeholder value, not a real service-to-service secret. ' +
+  'A placeholder secret would accept unauthenticated /mcp requests (CWE-306) and is refused even with MCP_ALLOW_INSECURE_DEV=1. ' +
+  'Generate a secret with `openssl rand -hex 32` and set CONDUIT_S2S_SECRET to that value.';
+
+function refuseStart(message: string): never {
+  logger.error(message);
+  process.exit(1);
+}
+
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/**
+ * Fail closed. Read at HTTP startup, not module load, so tests can set the
+ * env first. A known placeholder or unresolved template always refuses to
+ * start, even with MCP_ALLOW_INSECURE_DEV=1 -- that flag only bypasses a
+ * genuinely empty secret, and the bypass does not check X-Gateway-S2S. The
+ * secret value is never logged.
+ */
+function resolveS2sSecret(env: NodeJS.ProcessEnv = process.env): { secret: string; insecureDev: boolean } {
+  const trimmed = (env.CONDUIT_S2S_SECRET ?? '').trim();
+  if (isUsableConduitS2sSecret(trimmed)) {
+    return { secret: trimmed, insecureDev: false };
+  }
+
+  if (trimmed.length > 0) {
+    refuseStart(PLACEHOLDER_S2S_SECRET_ERROR);
+  }
+
+  if (env.MCP_ALLOW_INSECURE_DEV === '1') {
+    return { secret: '', insecureDev: true };
+  }
+
+  refuseStart(MISSING_S2S_SECRET_ERROR);
+}
+
+/**
+ * Start the Teramind MCP Streamable HTTP server.
+ *
+ * Fails closed: a missing or blank CONDUIT_S2S_SECRET logs an error and calls
+ * process.exit(1) before anything listens. MCP_ALLOW_INSECURE_DEV=1 bypasses
+ * only a missing or blank secret: it skips X-Gateway-S2S and binds 127.0.0.1
+ * only. A placeholder or otherwise unusable secret always exits, with or
+ * without that flag. With a secret, every /mcp request must carry a valid
+ * X-Gateway-S2S header; /health stays unauthenticated.
+ *
+ * @returns The listening `Server`, once `listen` has succeeded.
+ * @throws Rejects with the bind error (for example EADDRINUSE or EACCES) if
+ *   the port cannot be bound.
+ */
+export async function startHttpTransport(): Promise<Server> {
+  const { secret: s2sSecret, insecureDev } = resolveS2sSecret();
   const port = parseInt(process.env.MCP_HTTP_PORT || '8080', 10);
-  const host = process.env.MCP_HTTP_HOST || '0.0.0.0';
+  const { host, overriddenHost } = resolveHttpListenHost({
+    s2sSecret,
+    explicitHost: process.env.MCP_HTTP_HOST,
+  });
+
+  if (insecureDev) {
+    // error level so LOG_LEVEL=warn|error cannot hide the bypass.
+    logger.error(
+      'SECURITY WARNING: CONDUIT_S2S_SECRET is empty and MCP_ALLOW_INSECURE_DEV=1. ' +
+        'HTTP /mcp is not enforcing X-Gateway-S2S and listens on 127.0.0.1 only. ' +
+        'Do not use this outside local development.',
+    );
+    if (overriddenHost) {
+      logger.error(
+        `WARNING: MCP_HTTP_HOST=${overriddenHost} is not 127.0.0.1. ` +
+          'MCP_ALLOW_INSECURE_DEV=1 without a usable CONDUIT_S2S_SECRET cannot listen there. ' +
+          'Binding 127.0.0.1 only.',
+      );
+    }
+  }
+
   const isGatewayMode = process.env.AUTH_MODE === 'gateway';
 
   const httpServer = createHttpServer(async (req, res) => {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    // Fixed base: a malformed Host header must not throw before auth.
+    let url: URL;
+    try {
+      url = new URL(req.url || '/', 'http://localhost');
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Bad request' }));
+      return;
+    }
 
     if (url.pathname === '/health') {
       // /health is container LIVENESS, not credential-readiness. In gateway
       // mode, credentials arrive per-request via X-Teramind-Access-Token /
-      // X-Teramind-Instance-Url, not at startup - checking getCredentials()
-      // here would 503 the container permanently regardless of whether any
-      // customer has connected yet.
-      const creds = getCredentials();
+      // X-Teramind-Instance-Url, not at startup. This handler must not read
+      // vendor credentials.
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           status: 'ok',
           transport: 'http',
           mode: isGatewayMode ? 'gateway' : 'standalone',
-          credentials: { configured: !!creds },
           timestamp: new Date().toISOString(),
         })
       );
@@ -41,7 +149,10 @@ function startHttpServer(): void {
       return;
     }
 
-    if (S2S_SECRET && !verifyS2sHeader(req.headers[S2S_HEADER] as string | undefined, S2S_SECRET)) {
+    // Empty s2sSecret is only reachable when MCP_ALLOW_INSECURE_DEV=1; startup
+    // refuses otherwise. A configured secret is always enforced, before any
+    // credential extraction.
+    if (s2sSecret && !verifyS2sHeader(headerValue(req.headers[S2S_HEADER]), s2sSecret)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -51,12 +162,14 @@ function startHttpServer(): void {
       return;
     }
 
-    const accessToken = isGatewayMode
-      ? (req.headers['x-teramind-access-token'] as string | undefined)
-      : undefined;
-    const instanceUrl = isGatewayMode
-      ? (req.headers['x-teramind-instance-url'] as string | undefined)
-      : undefined;
+    // node:http does not await this listener. Catch a rejected connect or
+    // handleRequest so one bad request cannot crash the process. The log
+    // stays generic because error text can echo tenant credentials.
+    const fail = (error: unknown): void => {
+      logger.error('MCP request failed', { errorName: error instanceof Error ? error.name : typeof error });
+      if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+      if (!res.writableEnded) res.end(JSON.stringify({ error: 'Internal server error' }));
+    };
 
     const handle = async () => {
       // SECURITY-CRITICAL invariant: this transport MUST stay stateless
@@ -80,21 +193,54 @@ function startHttpServer(): void {
       await transport.handleRequest(req, res);
     };
 
-    if (accessToken && instanceUrl) {
-      await runWithCredentials({ accessToken, instanceUrl }, handle);
-    } else {
-      await handle();
+    // Gateway mode: credentials must arrive on every request via headers.
+    // Reject explicitly if missing. Falling through would resolve TERAMIND_*
+    // from the process environment, which is not request-scoped.
+    if (isGatewayMode) {
+      const accessToken = headerValue(req.headers['x-teramind-access-token']);
+      const instanceUrl = headerValue(req.headers['x-teramind-instance-url']);
+      if (!accessToken || !instanceUrl) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error:
+              'Missing credentials. Gateway must inject X-Teramind-Access-Token and X-Teramind-Instance-Url headers.',
+          })
+        );
+        return;
+      }
+      await runWithCredentials({ accessToken, instanceUrl }, handle).catch(fail);
+      return;
     }
+
+    await handle().catch(fail);
   });
 
-  httpServer.listen(port, host, () => {
-    logger.info(`HTTP streaming server listening on ${host}:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(port, host, () => {
+      httpServer.off('error', reject);
+      logger.info(`HTTP streaming server listening on ${host}:${port}`);
+      resolve();
+    });
   });
+
+  return httpServer;
 }
 
-const transport = process.env.MCP_TRANSPORT;
-if (transport === 'http') {
-  startHttpServer();
-} else {
-  import('./index.js');
+// Vitest imports this module to call startHttpTransport. Skip the CLI
+// entrypoint there. `node dist/http.js` still starts HTTP or falls through
+// to stdio, matching the previous module-load behavior.
+if (process.env.VITEST !== 'true') {
+  const transport = process.env.MCP_TRANSPORT;
+  if (transport === 'http') {
+    startHttpTransport().catch((error) => {
+      logger.error('Fatal startup error', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      process.exit(1);
+    });
+  } else {
+    import('./index.js');
+  }
 }

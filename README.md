@@ -30,7 +30,7 @@ Teramind's API is **per-customer-instance** (cloud or on-premise/private-cloud) 
 
 `MCP_TRANSPORT=http` refuses to start unless `CONDUIT_S2S_SECRET` is a real secret. Empty values and known placeholders are rejected, including `changeme`, `placeholder`, `your-s2s-secret`, `secret`, `password`, `test`, and any value that is only an unresolved `${...}` template. The process logs an error and exits non-zero. It never prints the secret.
 
-`MCP_ALLOW_INSECURE_DEV=1` is the local-only escape hatch for a genuinely empty secret — a known placeholder still refuses to start, even with this flag set. The process logs a warning, does not check `X-Gateway-S2S`, and listens on `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`, `localhost`, and `::1`) is ignored in that mode and the override is logged.
+`MCP_ALLOW_INSECURE_DEV=1` is the local-only escape hatch for a genuinely empty secret — a known placeholder still refuses to start, even with this flag set. The process logs a warning, does not check `X-Gateway-S2S`, and listens on `127.0.0.1` only. Any `MCP_HTTP_HOST` other than `127.0.0.1` (for example `0.0.0.0`, or the loopback aliases `localhost` and `::1`) is ignored in that mode, and the override is logged.
 
 Without a usable secret the bind address defaults to `127.0.0.1`. A configured secret honors `MCP_HTTP_HOST` (default `0.0.0.0` when that variable is unset, which is what the container image sets). Publish the host port on loopback unless a proxy sits in front.
 
@@ -157,8 +157,11 @@ The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaul
 
 ```bash
 docker build -t teramind-mcp .
+# Generate a real secret once and keep it in your shell or secret manager.
+# Placeholders such as your-s2s-secret are rejected at startup.
+export CONDUIT_S2S_SECRET="$(openssl rand -hex 32)"
 docker run \
-  -e CONDUIT_S2S_SECRET=your-s2s-secret \
+  -e CONDUIT_S2S_SECRET \
   -p 127.0.0.1:8080:8080 \
   teramind-mcp
 ```
@@ -166,14 +169,15 @@ docker run \
 Compose refuses to start when `CONDUIT_S2S_SECRET` is unset, sets `AUTH_MODE=gateway`, does not inject `TERAMIND_ACCESS_TOKEN` or `TERAMIND_INSTANCE_URL`, and publishes `127.0.0.1:8080:8080`:
 
 ```bash
-CONDUIT_S2S_SECRET=your-s2s-secret docker compose up
+# Uses CONDUIT_S2S_SECRET from your environment (see above).
+docker compose up
 ```
 
 Single-tenant HTTP (`AUTH_MODE=env`) still requires the S2S secret, then uses `TERAMIND_ACCESS_TOKEN` and `TERAMIND_INSTANCE_URL`:
 
 ```bash
 docker run \
-  -e CONDUIT_S2S_SECRET=your-s2s-secret \
+  -e CONDUIT_S2S_SECRET \
   -e AUTH_MODE=env \
   -e TERAMIND_ACCESS_TOKEN=... \
   -e TERAMIND_INSTANCE_URL=https://yourcompany.teramind.co \

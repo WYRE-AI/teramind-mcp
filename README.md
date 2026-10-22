@@ -125,6 +125,13 @@ They can be added as a follow-up if there's demand, after a deliberate scope dec
 
 **Net finding: by default, nothing about the Teramind access token credential itself prevents it from reaching every endpoint this connector deliberately excludes.** The connector's own code is the actual control boundary (per point 1 above), not the credential. **Recommendation for whoever operates Gate 3 review or advises customers connecting this vendor:** consider documenting that customers should create the token under a dedicated Operational Administrator account rather than a full Administrator, as defense-in-depth against a differently-configured client reusing the same stored token - while treating this connector's own code (which never calls a content-capture endpoint) as the primary, verified control.
 
+## Request limits
+
+- HTTP request bodies are capped at 256 KiB (262144 bytes). After the `X-Gateway-S2S` check passes, a `Content-Length` above the cap returns 413 with a JSON-RPC error; bodies without `Content-Length` are capped by the MCP SDK transport. Unauthenticated requests still get 401 first.
+- `tools/call` arguments are capped at 10,000 elements (every array item and object key at any depth). Larger inputs return an `isError` tool result and are never dispatched.
+
+These limits address CVE-2026-111768 / GHSA-46jr-4wx8-v453 (memory exhaustion during validation) and GHSA-f897-62hf-6gxq (no request body / batch cap).
+
 ## Development
 
 ```bash
